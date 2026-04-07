@@ -59,16 +59,25 @@ def check_server_health(base_url: str) -> tuple[bool, str]:
         return False, f"Health check failed: {e}"
 
 
+def resample(samples: np.ndarray, from_rate: int, to_rate: int) -> np.ndarray:
+    if from_rate == to_rate:
+        return samples
+    new_len = int(len(samples) * to_rate / from_rate)
+    indices = np.linspace(0, len(samples) - 1, new_len)
+    return np.interp(indices, np.arange(len(samples)), samples).astype(np.int16)
+
+
 def stream_audio(ws_url: str, stop_event: threading.Event, level_callback=None):
     p = pyaudio.PyAudio()
     try:
         loopback = p.get_default_wasapi_loopback()
+        device_rate = int(loopback["defaultSampleRate"])
         device_channels = loopback["maxInputChannels"]
 
         stream = p.open(
             format=FORMAT,
             channels=device_channels,
-            rate=SAMPLE_RATE,
+            rate=device_rate,
             input=True,
             input_device_index=loopback["index"],
             frames_per_buffer=CHUNK,
@@ -80,6 +89,7 @@ def stream_audio(ws_url: str, stop_event: threading.Event, level_callback=None):
                 mono = np.frombuffer(data, dtype=np.int16)
                 if device_channels == 2:
                     mono = mono.reshape(-1, 2).mean(axis=1).astype(np.int16)
+                mono = resample(mono, device_rate, SAMPLE_RATE)
                 if level_callback:
                     rms = np.sqrt(np.mean(mono.astype(np.float32) ** 2))
                     level_callback(min(rms / 32768.0, 1.0))
