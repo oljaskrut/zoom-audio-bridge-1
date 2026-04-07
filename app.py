@@ -19,7 +19,14 @@ CHUNK = 1024
 FORMAT = pyaudio.paInt16
 SAMPLE_RATE = 32000
 ZOOM_CHECK_INTERVAL_S = 2
-ZOOM_WINDOW_CLASSES = {"ZPFloatVideoWndClass", "ZPMeetingWndClass", "ZPMainWndClass"}
+ZOOM_WINDOW_CLASSES = {
+    "ConfMultiTabContentWndClass",
+    "ZPToolBarParentWndClass",
+    "ZPPTMainFrmWndClassEx",
+    "ZPFloatVideoWndClass",
+    "ZPMeetingWndClass",
+    "ZPMainWndClass",
+}
 
 
 def is_zoom_running() -> bool:
