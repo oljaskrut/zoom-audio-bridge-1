@@ -3,6 +3,8 @@ import os
 import time
 import threading
 import tkinter as tk
+import wave
+from datetime import datetime
 from tkinter import ttk
 from urllib.parse import urlparse
 from urllib.request import urlopen, Request
@@ -83,24 +85,42 @@ def stream_audio(ws_url: str, stop_event: threading.Event, level_callback=None):
             frames_per_buffer=CHUNK,
         )
 
-        with ws_client.connect(ws_url) as ws:
-            while not stop_event.is_set() and is_zoom_running():
-                data = stream.read(CHUNK, exception_on_overflow=False)
-                mono = np.frombuffer(data, dtype=np.int16)
-                if device_channels == 2:
-                    mono = mono.reshape(-1, 2).mean(axis=1).astype(np.int16)
-                mono = resample(mono, device_rate, SAMPLE_RATE)
-                if level_callback:
-                    rms = np.sqrt(np.mean(mono.astype(np.float32) ** 2))
-                    level_callback(min(rms / 32768.0, 1.0))
-                ws.send(mono.tobytes())
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        os.makedirs("recordings", exist_ok=True)
+        wav_raw = wave.open(f"recordings/{ts}_raw.wav", "wb")
+        wav_raw.setnchannels(device_channels)
+        wav_raw.setsampwidth(2)
+        wav_raw.setframerate(device_rate)
 
-            # tell server we're done
-            if not stop_event.is_set():
-                try:
-                    ws.send(json.dumps({"type": "stop_transcription"}))
-                except Exception:
-                    pass
+        wav_out = wave.open(f"recordings/{ts}_out.wav", "wb")
+        wav_out.setnchannels(1)
+        wav_out.setsampwidth(2)
+        wav_out.setframerate(SAMPLE_RATE)
+
+        try:
+            with ws_client.connect(ws_url) as ws:
+                while not stop_event.is_set() and is_zoom_running():
+                    data = stream.read(CHUNK, exception_on_overflow=False)
+                    wav_raw.writeframes(data)
+                    mono = np.frombuffer(data, dtype=np.int16)
+                    if device_channels == 2:
+                        mono = mono.reshape(-1, 2).mean(axis=1).astype(np.int16)
+                    mono = resample(mono, device_rate, SAMPLE_RATE)
+                    wav_out.writeframes(mono.tobytes())
+                    if level_callback:
+                        rms = np.sqrt(np.mean(mono.astype(np.float32) ** 2))
+                        level_callback(min(rms / 32768.0, 1.0))
+                    ws.send(mono.tobytes())
+
+                # tell server we're done
+                if not stop_event.is_set():
+                    try:
+                        ws.send(json.dumps({"type": "stop_transcription"}))
+                    except Exception:
+                        pass
+        finally:
+            wav_raw.close()
+            wav_out.close()
     finally:
         if "stream" in locals():
             stream.stop_stream()
