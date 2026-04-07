@@ -34,7 +34,9 @@ def is_zoom_running() -> bool:
 
     def callback(hwnd, acc):
         if win32gui.IsWindowVisible(hwnd):
-            if win32gui.GetClassName(hwnd) in ZOOM_WINDOW_CLASSES:
+            cls = win32gui.GetClassName(hwnd)
+            title = win32gui.GetWindowText(hwnd)
+            if cls in ZOOM_WINDOW_CLASSES or ("zoom" in title.lower() and cls.startswith("ZP")):
                 acc.append(hwnd)
 
     win32gui.EnumWindows(callback, found)
