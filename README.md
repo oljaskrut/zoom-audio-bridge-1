@@ -5,7 +5,7 @@ Captures Zoom meeting audio via WASAPI loopback and streams it over WebSocket to
 ## Requirements
 
 - Windows 10/11
-- Python 3.11+ ([download](https://www.python.org/downloads/)) — check "Add to PATH" during installation
+- Python 3.12.8 ([download installer](https://www.python.org/ftp/python/3.12.8/python-3.12.8-amd64.exe)) — check "Add to PATH" during installation
 
 ## Setup
 
