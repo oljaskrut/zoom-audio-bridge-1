@@ -9,6 +9,7 @@ from urllib.request import urlopen, Request
 
 import numpy as np
 import pyaudiowpatch as pyaudio
+from scipy.signal import resample_poly
 import win32gui
 import websockets.sync.client as ws_client
 from dotenv import load_dotenv
@@ -75,17 +76,23 @@ def stream_audio(ws_url: str, stop_event: threading.Event, level_callback=None):
             frames_per_buffer=CHUNK,
         )
 
+        from math import gcd
+        g = gcd(device_rate, SAMPLE_RATE)
+        up = SAMPLE_RATE // g
+        down = device_rate // g
+
         with ws_client.connect(ws_url) as ws:
             while not stop_event.is_set() and is_zoom_running():
                 data = stream.read(CHUNK, exception_on_overflow=False)
                 mono = np.frombuffer(data, dtype=np.int16)
                 if device_channels == 2:
                     mono = mono.reshape(-1, 2).mean(axis=1).astype(np.int16)
-                    data = mono.tobytes()
+                if device_rate != SAMPLE_RATE:
+                    mono = resample_poly(mono, up, down).astype(np.int16)
                 if level_callback:
                     rms = np.sqrt(np.mean(mono.astype(np.float32) ** 2))
                     level_callback(min(rms / 32768.0, 1.0))
-                ws.send(data)
+                ws.send(mono.tobytes())
 
             # tell server we're done
             if not stop_event.is_set():
