@@ -1,0 +1,5 @@
+PyAudioWPatch>=0.2
+pywin32>=306
+websockets>=13
+python-dotenv>=1
+numpy>=1.26

@@ -1,0 +1,15 @@
+[project]
+name = "zoom-audio-bridge"
+version = "0.1.0"
+description = "Capture Zoom meeting audio and stream it over WebSocket"
+requires-python = ">=3.11"
+dependencies = [
+    "PyAudioWPatch>=0.2",
+    "pywin32>=306",
+    "websockets>=13",
+    "python-dotenv>=1",
+    "numpy>=1.26",
+]
+
+[project.scripts]
+zoom-audio-bridge = "app:main"
