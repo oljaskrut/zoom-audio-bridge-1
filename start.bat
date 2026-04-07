@@ -2,11 +2,10 @@
 setlocal
 title Zoom Audio Bridge
 
-set PYTHON=python\tools\python.exe
-
-if not exist %PYTHON% (
+where python >nul 2>nul
+if %errorlevel% neq 0 (
     echo [ERROR] Python not found.
-    echo         Run setup.bat first.
+    echo         Install Python 3.11+ from https://www.python.org/downloads/
     echo.
     pause
     exit /b 1
@@ -22,7 +21,7 @@ if not exist .env (
 
 echo Starting Zoom Audio Bridge...
 echo.
-%PYTHON% app.py
+python app.py
 if %errorlevel% neq 0 (
     echo.
     echo [ERROR] Application exited with an error.
