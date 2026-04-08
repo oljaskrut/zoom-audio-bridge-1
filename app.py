@@ -1,10 +1,7 @@
 import json
 import os
-import time
 import threading
 import tkinter as tk
-import wave
-from datetime import datetime
 from tkinter import ttk
 from urllib.parse import urlparse
 from urllib.request import urlopen, Request
@@ -19,7 +16,6 @@ load_dotenv()
 
 CHUNK = 1024
 FORMAT = pyaudio.paInt16
-SAMPLE_RATE = 32000
 ZOOM_CHECK_INTERVAL_S = 2
 ZOOM_WINDOW_CLASSES = {
     "ConfMultiTabContentWndClass",
@@ -32,17 +28,18 @@ ZOOM_WINDOW_CLASSES = {
 
 
 def is_zoom_running() -> bool:
-    found = []
+    found = [False]
 
-    def callback(hwnd, acc):
+    def callback(hwnd, _):
         if win32gui.IsWindowVisible(hwnd):
             cls = win32gui.GetClassName(hwnd)
             title = win32gui.GetWindowText(hwnd)
             if cls in ZOOM_WINDOW_CLASSES or ("zoom" in title.lower() and cls.startswith("ZP")):
-                acc.append(hwnd)
+                found[0] = True
+                return False  # stop enumeration
 
-    win32gui.EnumWindows(callback, found)
-    return len(found) > 0
+    win32gui.EnumWindows(callback, None)
+    return found[0]
 
 
 def check_server_health(base_url: str) -> tuple[bool, str]:
@@ -61,15 +58,13 @@ def check_server_health(base_url: str) -> tuple[bool, str]:
         return False, f"Health check failed: {e}"
 
 
-def resample(samples: np.ndarray, from_rate: int, to_rate: int) -> np.ndarray:
-    if from_rate == to_rate:
-        return samples
-    new_len = int(len(samples) * to_rate / from_rate)
-    indices = np.linspace(0, len(samples) - 1, new_len)
-    return np.interp(indices, np.arange(len(samples)), samples).astype(np.int16)
+WS_PING_INTERVAL_S = 20
+WS_PING_TIMEOUT_S = 10
+WS_RECONNECT_DELAYS = [1, 2, 4, 8, 16]  # exponential backoff, max 16s
 
 
-def stream_audio(ws_url: str, stop_event: threading.Event, level_callback=None):
+def stream_audio(ws_url: str, stop_event: threading.Event, wave_callback=None,
+                 status_callback=None):
     p = pyaudio.PyAudio()
     try:
         loopback = p.get_default_wasapi_loopback()
@@ -85,42 +80,72 @@ def stream_audio(ws_url: str, stop_event: threading.Event, level_callback=None):
             frames_per_buffer=CHUNK,
         )
 
-        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-        os.makedirs("recordings", exist_ok=True)
-        wav_raw = wave.open(f"recordings/{ts}_raw.wav", "wb")
-        wav_raw.setnchannels(device_channels)
-        wav_raw.setsampwidth(2)
-        wav_raw.setframerate(device_rate)
+        send_every = max(1, int(0.05 * device_rate / CHUNK))  # ~50ms
+        zoom_check_every = max(1, int(ZOOM_CHECK_INTERVAL_S * device_rate / CHUNK))
+        reconnect_attempt = 0
 
-        wav_out = wave.open(f"recordings/{ts}_out.wav", "wb")
-        wav_out.setnchannels(1)
-        wav_out.setsampwidth(2)
-        wav_out.setframerate(SAMPLE_RATE)
+        while not stop_event.is_set() and is_zoom_running():
+            try:
+                ws = ws_client.connect(
+                    ws_url,
+                    ping_interval=WS_PING_INTERVAL_S,
+                    ping_timeout=WS_PING_TIMEOUT_S,
+                    close_timeout=5,
+                )
+            except Exception as e:
+                delay = WS_RECONNECT_DELAYS[min(reconnect_attempt, len(WS_RECONNECT_DELAYS) - 1)]
+                if status_callback:
+                    status_callback(f"Connection failed, retrying in {delay}s...")
+                reconnect_attempt += 1
+                stop_event.wait(delay)
+                continue
 
-        try:
-            with ws_client.connect(ws_url) as ws:
-                while not stop_event.is_set() and is_zoom_running():
+            reconnect_attempt = 0
+            if status_callback:
+                status_callback("Streaming audio...")
+            buffer: list[np.ndarray] = []
+            chunk_count = 0
+
+            try:
+                while not stop_event.is_set():
                     data = stream.read(CHUNK, exception_on_overflow=False)
-                    wav_raw.writeframes(data)
                     mono = np.frombuffer(data, dtype=np.int16)
                     if device_channels == 2:
                         mono = mono.reshape(-1, 2).mean(axis=1).astype(np.int16)
-                    mono = resample(mono, device_rate, SAMPLE_RATE)
-                    wav_out.writeframes(mono.tobytes())
-                    if level_callback:
-                        rms = np.sqrt(np.mean(mono.astype(np.float32) ** 2))
-                        level_callback(min(rms / 32768.0, 1.0))
-                    ws.send(mono.tobytes())
 
-                # tell server we're done
-                if not stop_event.is_set():
-                    try:
+                    buffer.append(mono)
+                    chunk_count += 1
+
+                    if chunk_count % send_every == 0:
+                        batch = np.concatenate(buffer)
+                        buffer.clear()
+                        ws.send(batch.tobytes())
+                        if wave_callback:
+                            wave_callback(batch)
+
+                    if chunk_count % zoom_check_every == 0 and not is_zoom_running():
+                        break
+
+                try:
+                    if buffer:
+                        batch = np.concatenate(buffer)
+                        ws.send(batch.tobytes())
+                        buffer.clear()
+                    if not stop_event.is_set():
                         ws.send(json.dumps({"type": "stop_transcription"}))
-                    except Exception:
-                        pass
-        finally:
-            wav_raw.close()
-            wav_out.close()
+                except Exception:
+                    pass
+                break  # clean exit — Zoom closed or stop requested
+            except Exception:
+                # WebSocket died mid-stream — reconnect without restarting audio
+                if status_callback:
+                    status_callback("Connection lost, reconnecting...")
+                continue
+            finally:
+                try:
+                    ws.close()
+                except Exception:
+                    pass
     finally:
         if "stream" in locals():
             stream.stop_stream()
@@ -129,14 +154,18 @@ def stream_audio(ws_url: str, stop_event: threading.Event, level_callback=None):
 
 
 class App:
+    _WAVE_WIDTH = 300
+    _WAVE_HEIGHT = 60
+
     def __init__(self, root: tk.Tk):
         self.root = root
         self.root.title("Zoom Audio Bridge")
         self.root.resizable(False, False)
 
         self.stop_event = threading.Event()
+        self.stop_event.set()  # starts in stopped state
         self.worker: threading.Thread | None = None
-        self._level = 0.0
+        self._wave_points: list[float] = []
 
         frame = ttk.Frame(root, padding=16)
         frame.pack()
@@ -151,10 +180,16 @@ class App:
         self.health_btn = ttk.Button(url_row, text="Check", command=self._check_health)
         self.health_btn.pack(side="left", padx=(8, 0))
 
-        # Level meter
-        self.meter = tk.Canvas(frame, width=300, height=20, bg="#222", highlightthickness=0)
-        self.meter.grid(row=2, column=0, columnspan=2, pady=(0, 12))
-        self._meter_bar = self.meter.create_rectangle(0, 0, 0, 20, fill="#4caf50", width=0)
+        # Waveform display
+        self.wave_canvas = tk.Canvas(
+            frame, width=self._WAVE_WIDTH, height=self._WAVE_HEIGHT,
+            bg="#111", highlightthickness=0,
+        )
+        self.wave_canvas.grid(row=2, column=0, columnspan=2, pady=(0, 12))
+        self._wave_line = self.wave_canvas.create_line(
+            0, self._WAVE_HEIGHT // 2, self._WAVE_WIDTH, self._WAVE_HEIGHT // 2,
+            fill="#4caf50", width=1,
+        )
 
         # Status
         self.status_var = tk.StringVar(value="Idle")
@@ -191,18 +226,25 @@ class App:
         ok, msg = check_server_health(ws_url)
         self.root.after(0, self.set_status, msg)
 
-    def _update_meter(self):
+    def _update_waveform(self):
         if self.stop_event.is_set():
-            self.meter.coords(self._meter_bar, 0, 0, 0, 20)
+            mid = self._WAVE_HEIGHT // 2
+            self.wave_canvas.coords(self._wave_line, 0, mid, self._WAVE_WIDTH, mid)
             return
-        width = int(self._level * 300)
-        color = "#4caf50" if self._level < 0.6 else "#ff9800" if self._level < 0.85 else "#f44336"
-        self.meter.coords(self._meter_bar, 0, 0, width, 20)
-        self.meter.itemconfig(self._meter_bar, fill=color)
-        self.root.after(50, self._update_meter)
+        points = self._wave_points
+        if len(points) >= 4:
+            self.wave_canvas.coords(self._wave_line, *points)
+        self.root.after(50, self._update_waveform)
 
-    def _on_level(self, level: float):
-        self._level = level
+    def _on_wave(self, samples: np.ndarray):
+        w = self._WAVE_WIDTH
+        h = self._WAVE_HEIGHT
+        mid = h // 2
+        step = max(1, len(samples) // w)
+        downsampled = samples[::step][:w].astype(np.float32) / 32768.0
+        x = np.linspace(0, w, len(downsampled))
+        y = mid - downsampled * mid
+        self._wave_points = np.column_stack((x, y)).ravel().tolist()
 
     def start(self):
         base = self.server_url.get().strip()
@@ -211,52 +253,60 @@ class App:
             return
 
         self.stop_event.clear()
-        self._level = 0.0
+        self._wave_points = []
         self.start_btn.config(state="disabled")
         self.stop_btn.config(state="normal")
         self.url_entry.config(state="disabled")
         self.health_btn.config(state="disabled")
         self.set_status("Checking server...")
-        self._update_meter()
+        self._update_waveform()
 
         ws_url = self._build_ws_url()
         self.worker = threading.Thread(target=self._run, args=(ws_url,), daemon=True)
         self.worker.start()
 
     def stop(self):
+        if self.stop_event.is_set():
+            return
         self.stop_event.set()
-        self._level = 0.0
-        self.meter.coords(self._meter_bar, 0, 0, 0, 20)
+        self._wave_points = []
+        mid = self._WAVE_HEIGHT // 2
+        self.wave_canvas.coords(self._wave_line, 0, mid, self._WAVE_WIDTH, mid)
         self.start_btn.config(state="normal")
         self.stop_btn.config(state="disabled")
         self.url_entry.config(state="normal")
         self.health_btn.config(state="normal")
         self.set_status("Idle")
 
+    def _set_status_safe(self, text: str):
+        self.root.after(0, self.set_status, text)
+
     def _run(self, ws_url: str):
         try:
             ok, msg = check_server_health(ws_url)
             if not ok:
-                self.root.after(0, self.set_status, msg)
+                self._set_status_safe(msg)
                 return
 
-            self.root.after(0, self.set_status, "Waiting for Zoom...")
+            self._set_status_safe("Waiting for Zoom...")
             while not self.stop_event.is_set():
                 if is_zoom_running():
-                    self.root.after(0, self.set_status, "Streaming audio...")
                     try:
-                        stream_audio(ws_url, self.stop_event, self._on_level)
+                        stream_audio(ws_url, self.stop_event, self._on_wave,
+                                     self._set_status_safe)
                     except Exception as e:
-                        self.root.after(0, self.set_status, f"Error: {e}")
-                        time.sleep(3)
+                        self._set_status_safe(f"Error: {e}")
+                        self.stop_event.wait(3)
                         continue
-                    self.root.after(0, self.set_status, "Zoom ended. Waiting...")
-                time.sleep(ZOOM_CHECK_INTERVAL_S)
+                    self._set_status_safe("Zoom ended. Waiting...")
+                self.stop_event.wait(ZOOM_CHECK_INTERVAL_S)
         finally:
             self.root.after(0, self.stop)
 
     def on_close(self):
         self.stop_event.set()
+        if self.worker and self.worker.is_alive():
+            self.worker.join(timeout=2)
         self.root.destroy()
 
 
